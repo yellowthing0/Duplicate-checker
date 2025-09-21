@@ -12,7 +12,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QScrollArea, QGroupBox,
-    QPushButton, QGridLayout, QSizePolicy, QStackedLayout
+    QPushButton, QGridLayout, QSizePolicy, QStackedLayout, QFileDialog, QMessageBox
 )
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtCore import Qt
@@ -357,7 +357,7 @@ def open_file_location(path):
 
 # --- UI ---
 class DuplicateListWindow(QWidget):
-    def __init__(self, duplicates, stats):
+    def __init__(self, duplicates, stats, root_dir):
         super().__init__()
         self.duplicates = duplicates
         self.stats = stats
@@ -368,8 +368,9 @@ class DuplicateListWindow(QWidget):
 
         self.main_layout = QVBoxLayout(self)
 
-        title = QLabel("📂 Duplicate File Gallery")
-        title.setFont(QFont("Arial", 24, QFont.Weight.Bold))
+        title = QLabel(f"📂 Duplicate File Gallery — {root_dir}")
+        title.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+        title.setWordWrap(True)
         self.main_layout.addWidget(title)
 
         # Summary lines
@@ -498,20 +499,34 @@ class DuplicateListWindow(QWidget):
 def main():
     # Make stdout line-buffered so progress prints show up immediately.
     try:
-        # Python 3.7+
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
 
-    # Allow passing a directory as first arg; default to cwd.
-    root_dir = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    # Start Qt early so we can show a folder picker if needed
+    app = QApplication(sys.argv)
+
+    # Choose root dir: CLI arg wins; else show a folder picker dialog
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        root_dir = sys.argv[1]
+    else:
+        # Default to user's home directory in the picker
+        start_dir = os.path.expanduser("~")
+        root_dir = QFileDialog.getExistingDirectory(
+            None,
+            "Select a folder to scan for duplicates",
+            start_dir
+        )
+        if not root_dir:
+            QMessageBox.information(None, "Duplicate File Gallery", "No folder selected. Exiting.")
+            sys.exit(0)
+
     print(f"📁 Starting scan in: {root_dir}", flush=True)
 
     duplicates, stats = find_duplicates(root_dir)
 
-    # Start UI
-    app = QApplication(sys.argv)
-    window = DuplicateListWindow(duplicates, stats)
+    # Show main window with results
+    window = DuplicateListWindow(duplicates, stats, root_dir)
     window.show()
     sys.exit(app.exec())
 
