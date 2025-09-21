@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QGridLayout, QSizePolicy, QStackedLayout, QFileDialog, QMessageBox
 )
 from PyQt6.QtGui import QFont, QPixmap
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
 
@@ -156,11 +156,11 @@ def group_total_size(paths):
             pass
     return total
 
-def sorted_duplicate_items(duplicates):
+def sorted_duplicate_items(duplicates, group_sizes):
     # Sort duplicate groups by total size descending
     return sorted(
         duplicates.items(),
-        key=lambda kv: sum(os.path.getsize(p) for p in kv[1] if os.path.exists(p)),
+        key=lambda kv: group_sizes.get(kv[0], 0),
         reverse=True
     )
 
@@ -315,14 +315,19 @@ def find_duplicates(root_dir):
     # Build duplicates dict (only keep groups with more than 1 file)
     duplicates = {h: paths for h, paths in full_hash_map.items() if len(paths) > 1}
 
-    # Total duplicate size (sum of sizes of all files that are in duplicate sets)
-    total_duplicate_size = 0
-    for paths in duplicates.values():
+    # Precompute group sizes once
+    group_sizes = {}
+    for h, paths in duplicates.items():
+        total = 0
         for p in paths:
             try:
-                total_duplicate_size += os.path.getsize(p)
+                total += os.path.getsize(p)
             except Exception:
                 pass
+        group_sizes[h] = total
+
+    # Total duplicate size (sum of sizes of all files that are in duplicate sets)
+    total_duplicate_size = sum(group_sizes.values())
 
     # Save cache
     if ENABLE_CACHE:
@@ -340,27 +345,47 @@ def find_duplicates(root_dir):
     }
 
     print("✅ Scan complete.", flush=True)
-    return duplicates, stats
+    return duplicates, stats, group_sizes
 
 # --- UX helpers ---
 def open_file_location(path):
-    folder = os.path.dirname(path)
+    # Robust "open containing folder" with file selected where possible.
     try:
         if platform.system() == "Windows":
-            subprocess.run(["explorer", "/select,", path])
+            p = os.path.normpath(path)
+            # First try standard argument list
+            try:
+                subprocess.run(["explorer", "/select,", p], check=False)
+            except Exception:
+                # Fallback: shell string with quotes
+                subprocess.run(f'explorer /select,"{p}"', shell=True, check=False)
         elif platform.system() == "Darwin":
-            subprocess.run(["open", "-R", path])
+            subprocess.run(["open", "-R", path], check=False)
         else:
-            subprocess.run(["xdg-open", folder])
-    except Exception:
-        pass
+            # Linux: try xdg-open on the directory; fall back to common FMs
+            folder = os.path.dirname(path) or "."
+            try:
+                subprocess.run(["xdg-open", folder], check=False)
+            except FileNotFoundError:
+                for fm in (["gio", "open", folder],
+                           ["nautilus", folder],
+                           ["dolphin", folder],
+                           ["thunar", folder]):
+                    try:
+                        subprocess.Popen(fm)
+                        break
+                    except FileNotFoundError:
+                        continue
+    except Exception as e:
+        print(f"[open_file_location] Failed for {path}: {e}", flush=True)
 
 # --- UI ---
 class DuplicateListWindow(QWidget):
-    def __init__(self, duplicates, stats, root_dir):
+    def __init__(self, duplicates, stats, root_dir, group_sizes):
         super().__init__()
         self.duplicates = duplicates
         self.stats = stats
+        self.group_sizes = group_sizes
         self.grid_mode = False
 
         self.setWindowTitle("🖼️ Duplicate File Gallery")
@@ -394,15 +419,20 @@ class DuplicateListWindow(QWidget):
 
         self.stacked_layout = QStackedLayout()
         self.list_widget = self.create_list_view()
-        self.grid_widget = self.create_grid_view()
+        self.grid_widget = None  # build lazily
         self.stacked_layout.addWidget(self.list_widget)
-        self.stacked_layout.addWidget(self.grid_widget)
 
         self.main_layout.addLayout(self.stacked_layout)
 
     def toggle_view(self):
         self.grid_mode = not self.grid_mode
-        self.stacked_layout.setCurrentIndex(1 if self.grid_mode else 0)
+        if self.grid_mode:
+            if self.grid_widget is None:
+                self.grid_widget = self.create_grid_view()  # build on demand
+                self.stacked_layout.addWidget(self.grid_widget)
+            self.stacked_layout.setCurrentWidget(self.grid_widget)
+        else:
+            self.stacked_layout.setCurrentWidget(self.list_widget)
 
     def create_list_view(self):
         scroll = QScrollArea()
@@ -413,8 +443,8 @@ class DuplicateListWindow(QWidget):
         if not self.duplicates:
             scroll_layout.addWidget(QLabel("✅ No duplicates found."))
         else:
-            for _, files in sorted_duplicate_items(self.duplicates):
-                total_size = group_total_size(files)
+            for h, files in sorted_duplicate_items(self.duplicates, self.group_sizes):
+                total_size = self.group_sizes.get(h, 0)
                 group_box = QGroupBox(f"🔷 {len(files)} Duplicates — {human_readable_size(total_size)}")
                 group_layout = QGridLayout()
 
@@ -441,6 +471,7 @@ class DuplicateListWindow(QWidget):
         return scroll
 
     def create_grid_view(self):
+        # Build the grid only when the user toggles to it
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll_content = QWidget()
@@ -452,7 +483,7 @@ class DuplicateListWindow(QWidget):
             col_count = 5
             row = col = 0
 
-            for _, files in sorted_duplicate_items(self.duplicates):
+            for _, files in sorted_duplicate_items(self.duplicates, self.group_sizes):
                 for path in sorted(files):
                     box = QGroupBox()
                     vbox = QVBoxLayout()
@@ -495,7 +526,30 @@ class DuplicateListWindow(QWidget):
         scroll.setWidget(scroll_content)
         return scroll
 
+# --- Background worker to keep UI responsive ---
+class ScanWorker(QObject):
+    finished = pyqtSignal(dict, dict, dict)  # duplicates, stats, group_sizes
+    error = pyqtSignal(str)
+
+    def __init__(self, root_dir):
+        super().__init__()
+        self.root_dir = root_dir
+
+    def run(self):
+        try:
+            dups, stats, group_sizes = find_duplicates(self.root_dir)
+            self.finished.emit(dups, stats, group_sizes)
+        except Exception as e:
+            self.error.emit(str(e))
+
 # --- Main ---
+def pick_or_cli_dir():
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        return sys.argv[1]
+    start_dir = os.path.expanduser("~")
+    root_dir = QFileDialog.getExistingDirectory(None, "Select a folder to scan for duplicates", start_dir)
+    return root_dir
+
 def main():
     # Make stdout line-buffered so progress prints show up immediately.
     try:
@@ -503,34 +557,63 @@ def main():
     except Exception:
         pass
 
-    # Start Qt early so we can show a folder picker if needed
     app = QApplication(sys.argv)
 
-    # Choose root dir: CLI arg wins; else show a folder picker dialog
-    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
-        root_dir = sys.argv[1]
-    else:
-        # Default to user's home directory in the picker
-        start_dir = os.path.expanduser("~")
-        root_dir = QFileDialog.getExistingDirectory(
-            None,
-            "Select a folder to scan for duplicates",
-            start_dir
-        )
-        if not root_dir:
-            QMessageBox.information(None, "Duplicate File Gallery", "No folder selected. Exiting.")
-            sys.exit(0)
+    root_dir = pick_or_cli_dir()
+    if not root_dir:
+        QMessageBox.information(None, "Duplicate File Gallery", "No folder selected. Exiting.")
+        sys.exit(0)
 
-    print(f"📁 Starting scan in: {root_dir}", flush=True)
+    # Show a simple splash/progress window immediately
+    splash = QWidget()
+    splash.setWindowTitle("Duplicate File Gallery — Scanning...")
+    vbox = QVBoxLayout(splash)
+    msg = QLabel(f"Scanning {root_dir}...\nThis window will update when the scan completes.")
+    msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    msg.setFont(QFont("Arial", 12))
+    vbox.addWidget(msg)
+    splash.resize(520, 140)
+    splash.show()
 
-    duplicates, stats = find_duplicates(root_dir)
+    # Start worker thread
+    thread = QThread()
+    worker = ScanWorker(root_dir)
+    worker.moveToThread(thread)
 
-    # Show main window with results
-    window = DuplicateListWindow(duplicates, stats, root_dir)
-    window.show()
+    def on_finished(duplicates, stats, group_sizes):
+        # Build the main window now, quickly (grid view is lazy)
+        window = DuplicateListWindow(duplicates, stats, root_dir, group_sizes)
+        window.show()
+        splash.close()
+        # Keep references alive
+        app._main_window = window
+        thread.quit()
+        thread.wait()
+
+    def on_error(err_msg):
+        splash.close()
+        QMessageBox.critical(None, "Scan Error", f"An error occurred during the scan:\n{err_msg}")
+        thread.quit()
+        thread.wait()
+        sys.exit(2)
+
+    thread.started.connect(worker.run)
+    worker.finished.connect(on_finished)
+    worker.error.connect(on_error)
+
+    thread.start()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
+    # Safe multiprocessing setup for Windows/macOS and PyInstaller
+    import multiprocessing as mp
+    if platform.system() in ("Windows", "Darwin"):
+        mp.freeze_support()
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+
     try:
         main()
     except KeyboardInterrupt:
