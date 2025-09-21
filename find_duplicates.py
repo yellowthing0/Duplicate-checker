@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -12,10 +11,17 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QScrollArea, QGroupBox,
-    QPushButton, QGridLayout, QSizePolicy, QStackedLayout, QFileDialog, QMessageBox
+    QPushButton, QGridLayout, QSizePolicy, QStackedLayout, QFileDialog, QMessageBox,
+    QHBoxLayout, QCheckBox, QComboBox
 )
 from PyQt6.QtGui import QFont, QPixmap
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+
+# Try to use system trash instead of permanent delete
+try:
+    from send2trash import send2trash
+except Exception:
+    send2trash = None
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
 
@@ -147,15 +153,6 @@ def human_readable_size(size):
     return f"{size} B"
 
 # --- Helpers for UI reuse ---
-def group_total_size(paths):
-    total = 0
-    for p in paths:
-        try:
-            total += os.path.getsize(p)
-        except Exception:
-            pass
-    return total
-
 def sorted_duplicate_items(duplicates, group_sizes):
     # Sort duplicate groups by total size descending
     return sorted(
@@ -353,16 +350,13 @@ def open_file_location(path):
     try:
         if platform.system() == "Windows":
             p = os.path.normpath(path)
-            # First try standard argument list
             try:
                 subprocess.run(["explorer", "/select,", p], check=False)
             except Exception:
-                # Fallback: shell string with quotes
                 subprocess.run(f'explorer /select,"{p}"', shell=True, check=False)
         elif platform.system() == "Darwin":
             subprocess.run(["open", "-R", path], check=False)
         else:
-            # Linux: try xdg-open on the directory; fall back to common FMs
             folder = os.path.dirname(path) or "."
             try:
                 subprocess.run(["xdg-open", folder], check=False)
@@ -379,6 +373,103 @@ def open_file_location(path):
     except Exception as e:
         print(f"[open_file_location] Failed for {path}: {e}", flush=True)
 
+# --- Windows network drive helper ---
+def _to_unc_if_network_drive(path):
+    # Convert 'E:\\...' mapped network drive to UNC '\\\\server\\share\\...' when possible
+    if platform.system() != "Windows":
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes, byref, create_string_buffer, cast, POINTER, c_void_p
+
+        # Only drive-letter paths can be mapped drives
+        p = os.path.abspath(path)
+        if len(p) < 2 or p[1] != ":":
+            return path
+
+        WNetGetUniversalNameW = ctypes.windll.mpr.WNetGetUniversalNameW
+        UNIVERSAL_NAME_INFO_LEVEL = 0x00000001  # UNIVERSAL_NAME_INFO
+        ERROR_MORE_DATA = 234
+        # First call to get required size
+        size = wintypes.DWORD(0)
+        res = WNetGetUniversalNameW(p, UNIVERSAL_NAME_INFO_LEVEL, None, byref(size))
+        if res not in (0, ERROR_MORE_DATA):
+            return path
+        if size.value == 0:
+            size.value = 2048
+        buf = create_string_buffer(size.value)
+        res = WNetGetUniversalNameW(p, UNIVERSAL_NAME_INFO_LEVEL, buf, byref(size))
+        if res != 0:
+            return path
+
+        class UNIVERSAL_NAME_INFO(ctypes.Structure):
+            _fields_ = [("lpUniversalName", wintypes.LPWSTR)]
+
+        uni = cast(buf, POINTER(UNIVERSAL_NAME_INFO)).contents
+        unc = uni.lpUniversalName
+        return unc if unc else path
+    except Exception:
+        return path
+
+def _trash_path_windows(p: str) -> bool:
+    """
+    Try to send to Recycle Bin on Windows.
+    Falls back to UNC for mapped drives. Returns True on success, raises on error.
+    """
+    if send2trash is None:
+        raise OSError("send2trash not installed")
+
+    # Normalize to absolute & collapse oddities
+    p_abs = os.path.abspath(os.path.normpath(p))
+
+    try:
+        send2trash(p_abs)
+        return True
+    except Exception as e:
+        msg = str(e)
+        # Retry with UNC if this looks like a mapped drive issue (Errno 3 / 'path specified')
+        if ("[Errno 3]" in msg or "path specified" in msg) and len(p_abs) >= 3 and p_abs[1] == ":":
+            unc = _to_unc_if_network_drive(p_abs)
+            if unc and unc != p_abs:
+                try:
+                    send2trash(unc)
+                    return True
+                except Exception:
+                    pass
+        # Re-raise so caller can decide on permanent delete
+        raise
+
+# Selection/keep rule helpers
+KEEP_RULES = ["Newest (keep most recent)", "Oldest (keep oldest)", "Alphabetical (keep A→Z)", "Shortest path"]
+
+def choose_keep(files, rule_text):
+    # returns the path to keep within this group
+    if rule_text.startswith("Newest"):
+        best = None; best_m = -1
+        for p in files:
+            try:
+                m = os.stat(p).st_mtime
+            except Exception:
+                m = -1
+            if m > best_m:
+                best_m, best = m, p
+        return best or files[0]
+    if rule_text.startswith("Oldest"):
+        best = None; best_m = 1e30
+        for p in files:
+            try:
+                m = os.stat(p).st_mtime
+            except Exception:
+                m = 1e30
+            if m < best_m:
+                best_m, best = m, p
+        return best or files[0]
+    if rule_text.startswith("Alphabetical"):
+        return sorted(files)[0]
+    if rule_text.startswith("Shortest"):
+        return sorted(files, key=lambda p: (len(p), p))[0]
+    return files[0]
+
 # --- UI ---
 class DuplicateListWindow(QWidget):
     def __init__(self, duplicates, stats, root_dir, group_sizes):
@@ -386,15 +477,24 @@ class DuplicateListWindow(QWidget):
         self.duplicates = duplicates
         self.stats = stats
         self.group_sizes = group_sizes
+        self.root_dir = root_dir
+
         self.grid_mode = False
+        self.selected = set()  # selected paths to delete
+        self.checkboxes = {}    # path -> checkbox (list view)
+        self.grid_checkboxes = {}  # path -> checkbox (grid view)
 
         self.setWindowTitle("🖼️ Duplicate File Gallery")
-        self.setGeometry(200, 200, 1200, 800)
+        self.setGeometry(120, 120, 1250, 820)
 
         self.main_layout = QVBoxLayout(self)
 
         title = QLabel(f"📂 Duplicate File Gallery — {root_dir}")
-        title.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+        # PyQt6: QFont.Weight exists; fallback keeps compatibility
+        if hasattr(QFont, "Weight"):
+            title.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+        else:
+            title.setFont(QFont("Arial", 18))
         title.setWordWrap(True)
         self.main_layout.addWidget(title)
 
@@ -409,21 +509,209 @@ class DuplicateListWindow(QWidget):
             f"🗑️ Total duplicate size: {human_readable_size(stats['total_duplicate_size'])}",
             f"⏱️ Elapsed time: {stats['elapsed_seconds']:.2f}s"
         ]
-        stats_label = QLabel("\n".join(filter(None, summary)))
+        stats_label = QLabel("\n".join([s for s in summary if s]))
         stats_label.setFont(QFont("Arial", 11))
         self.main_layout.addWidget(stats_label)
 
+        # Controls: view toggle + deletion controls
+        controls = QHBoxLayout()
         self.toggle_button = QPushButton("🔄 Toggle View")
         self.toggle_button.clicked.connect(self.toggle_view)
-        self.main_layout.addWidget(self.toggle_button)
+        controls.addWidget(self.toggle_button)
 
+        controls.addWidget(QLabel("Keep rule:"))
+        self.keep_combo = QComboBox()
+        self.keep_combo.addItems(KEEP_RULES)
+        controls.addWidget(self.keep_combo)
+
+        self.auto_select_btn = QPushButton("✨ Auto-select deletions")
+        self.auto_select_btn.clicked.connect(self.auto_select_deletions)
+        controls.addWidget(self.auto_select_btn)
+
+        self.clear_sel_btn = QPushButton("Clear selection")
+        self.clear_sel_btn.clicked.connect(self.clear_selection)
+        controls.addWidget(self.clear_sel_btn)
+
+        self.delete_btn = QPushButton("🗑️ Send selected to Trash")
+        self.delete_btn.clicked.connect(self.delete_selected)
+        controls.addWidget(self.delete_btn)
+
+        self.main_layout.addLayout(controls)
+
+        # Stacked views
         self.stacked_layout = QStackedLayout()
         self.list_widget = self.create_list_view()
         self.grid_widget = None  # build lazily
         self.stacked_layout.addWidget(self.list_widget)
-
         self.main_layout.addLayout(self.stacked_layout)
 
+    # --- Selection & Deletion logic ---
+    def mark_selected(self, path, checked, origin="list"):
+        if checked:
+            self.selected.add(path)
+        else:
+            self.selected.discard(path)
+
+        # keep checkboxes in sync across views
+        cb = self.checkboxes.get(path)
+        if cb and origin != "list":
+            cb.blockSignals(True); cb.setChecked(checked); cb.blockSignals(False)
+        gcb = self.grid_checkboxes.get(path)
+        if gcb and origin != "grid":
+            gcb.blockSignals(True); gcb.setChecked(checked); gcb.blockSignals(False)
+
+    def auto_select_deletions(self):
+        rule = self.keep_combo.currentText()
+        sel_before = len(self.selected)
+        for h, files in self.duplicates.items():
+            if len(files) < 2:
+                continue
+            keep = choose_keep(files, rule)
+            for p in files:
+                want = (p != keep)
+                self.mark_selected(p, want)
+        delta = len(self.selected) - sel_before
+        QMessageBox.information(self, "Auto-select", f"Selected {delta} files for deletion using rule:\n{rule}")
+
+    def clear_selection(self):
+        for p in list(self.selected):
+            self.mark_selected(p, False)
+        self.selected.clear()
+
+    def _delete_paths(self, paths):
+        errors = []
+        deleted = []
+        if not paths:
+            return deleted, errors
+
+        for p in paths:
+            try:
+                # Prefer Recycle Bin when available
+                if platform.system() == "Windows" and send2trash is not None:
+                    try:
+                        if _trash_path_windows(p):
+                            deleted.append(p); continue
+                    except Exception as trash_err:
+                        # If Trash fails on this item: offer one-time permanent delete
+                        pretty = os.path.basename(p)
+                        ret = QMessageBox.question(
+                            self, "Trash unavailable — delete permanently?",
+                            f"Windows couldn't move this file to the Recycle Bin:\n\n{pretty}\n\n"
+                            f"Reason: {trash_err}\n\n"
+                            f"Do you want to delete it permanently?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        )
+                        if ret == QMessageBox.StandardButton.Yes:
+                            try:
+                                os.remove(p)
+                                deleted.append(p); continue
+                            except Exception as e2:
+                                errors.append((p, str(e2)))
+                                continue
+                        else:
+                            # user declined — keep file and record the failure reason
+                            errors.append((p, str(trash_err)))
+                            continue
+
+                # Non-Windows or no send2trash: ask once up front (you can wrap this with a global prompt if preferred)
+                if send2trash is None or platform.system() != "Windows":
+                    try:
+                        if send2trash is not None and platform.system() != "Windows":
+                            send2trash(p)
+                        else:
+                            os.remove(p)
+                        deleted.append(p)
+                        continue
+                    except Exception as e:
+                        errors.append((p, str(e)))
+                        continue
+
+            except Exception as e:
+                errors.append((p, str(e)))
+
+        return deleted, errors
+
+    def delete_selected(self):
+        if not self.selected:
+            QMessageBox.information(self, "No selection", "No files are selected for deletion.")
+            return
+        total = 0
+        for p in self.selected:
+            try:
+                total += os.path.getsize(p)
+            except Exception:
+                pass
+        pretty = human_readable_size(total)
+        ret = QMessageBox.question(
+            self, "Confirm Deletion",
+            f"Send {len(self.selected)} selected file(s) to Trash?\nApprox total size: {pretty}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        to_delete = sorted(self.selected)
+        deleted, errors = self._delete_paths(to_delete)
+
+        if errors:
+            msg = "\n".join([f"{p}: {e}" for p, e in errors][:10])
+            QMessageBox.warning(self, "Some deletions failed", msg)
+
+        if deleted:
+            # Update in-memory structures
+            self._apply_deletions(deleted)
+            self.selected.difference_update(deleted)
+            QMessageBox.information(self, "Deleted", f"Sent {len(deleted)} file(s) to Trash or removed permanently.")
+            self.refresh_views()
+
+    def delete_others_in_group(self, files):
+        # Keep one based on combobox rule; delete the rest
+        rule = self.keep_combo.currentText()
+        keep = choose_keep(files, rule)
+        victims = [p for p in files if p != keep]
+        if not victims:
+            QMessageBox.information(self, "Nothing to delete", "No other files to delete in this group.")
+            return
+        total = sum((os.path.getsize(p) if os.path.exists(p) else 0) for p in victims)
+        ret = QMessageBox.question(
+            self, "Confirm Deletion",
+            f"Keep 1 ({os.path.basename(keep)}) and send {len(victims)} other file(s) to Trash?\n"
+            f"Approx total size: {human_readable_size(total)}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        deleted, errors = self._delete_paths(victims)
+        if errors:
+            msg = "\n".join([f"{p}: {e}" for p, e in errors][:10])
+            QMessageBox.warning(self, "Some deletions failed", msg)
+        if deleted:
+            self._apply_deletions(deleted)
+            self.selected.difference_update(deleted)
+            QMessageBox.information(self, "Deleted", f"Sent {len(deleted)} file(s) to Trash or removed permanently.")
+            self.refresh_views()
+
+    def _apply_deletions(self, deleted_paths):
+        # Remove paths from duplicates; drop groups < 2; recompute group_sizes
+        new_dups = {}
+        for h, files in self.duplicates.items():
+            remaining = [p for p in files if p not in deleted_paths and os.path.exists(p)]
+            if len(remaining) >= 2:
+                new_dups[h] = remaining
+        self.duplicates = new_dups
+
+        new_sizes = {}
+        for h, files in self.duplicates.items():
+            total = 0
+            for p in files:
+                try:
+                    total += os.path.getsize(p)
+                except Exception:
+                    pass
+            new_sizes[h] = total
+        self.group_sizes = new_sizes
+
+    # --- Views ---
     def toggle_view(self):
         self.grid_mode = not self.grid_mode
         if self.grid_mode:
@@ -434,48 +722,76 @@ class DuplicateListWindow(QWidget):
         else:
             self.stacked_layout.setCurrentWidget(self.list_widget)
 
+    def refresh_views(self):
+        # Rebuild list view; if grid exists, drop & rebuild lazily again
+        if self.list_widget:
+            self.list_widget.setParent(None)
+        self.checkboxes.clear()
+        self.grid_checkboxes.clear()
+        self.list_widget = self.create_list_view()
+        # Reset stacked layout
+        while self.stacked_layout.count():
+            w = self.stacked_layout.widget(0)
+            self.stacked_layout.removeWidget(w)
+            w.setParent(None)
+        self.grid_widget = None
+        self.stacked_layout.addWidget(self.list_widget)
+        self.grid_mode = False
+
     def create_list_view(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
+        content = QWidget()
+        vbox = QVBoxLayout(content)
 
         if not self.duplicates:
-            scroll_layout.addWidget(QLabel("✅ No duplicates found."))
+            vbox.addWidget(QLabel("✅ No duplicates found."))
         else:
             for h, files in sorted_duplicate_items(self.duplicates, self.group_sizes):
                 total_size = self.group_sizes.get(h, 0)
                 group_box = QGroupBox(f"🔷 {len(files)} Duplicates — {human_readable_size(total_size)}")
                 group_layout = QGridLayout()
 
-                for i, path in enumerate(sorted(files)):
+                # Per-group "Delete others" button (respects keep rule)
+                del_others = QPushButton("Delete Others (keep 1)")
+                del_others.clicked.connect(lambda _, fl=list(files): self.delete_others_in_group(fl))
+                group_layout.addWidget(del_others, 0, 0, 1, 3)
+
+                header = QLabel("<b>Files</b>")
+                group_layout.addWidget(header, 0, 3)
+
+                for idx, path in enumerate(sorted(files), start=1):
                     try:
                         size_text = human_readable_size(os.path.getsize(path))
                     except Exception:
                         size_text = "N/A"
 
+                    cb = QCheckBox()
+                    cb.setChecked(path in self.selected)
+                    cb.stateChanged.connect(lambda state, p=path: self.mark_selected(p, state == Qt.CheckState.Checked, "list"))
+                    self.checkboxes[path] = cb
+                    group_layout.addWidget(cb, idx, 0)
+
                     file_label = QLabel(f"{os.path.basename(path)}\n{size_text}")
                     file_label.setWordWrap(True)
                     file_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                    group_layout.addWidget(file_label, idx, 1, 1, 2)
 
                     open_button = QPushButton("Open in Folder")
                     open_button.clicked.connect(lambda _, p=path: open_file_location(p))
-
-                    group_layout.addWidget(file_label, i, 0)
-                    group_layout.addWidget(open_button, i, 1)
+                    group_layout.addWidget(open_button, idx, 3)
 
                 group_box.setLayout(group_layout)
-                scroll_layout.addWidget(group_box)
+                vbox.addWidget(group_box)
 
-        scroll.setWidget(scroll_content)
+        scroll.setWidget(content)
         return scroll
 
     def create_grid_view(self):
-        # Build the grid only when the user toggles to it
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        grid_layout = QGridLayout(scroll_content)
+        content = QWidget()
+        grid_layout = QGridLayout(content)
 
         if not self.duplicates:
             grid_layout.addWidget(QLabel("✅ No duplicates found."))
@@ -492,9 +808,9 @@ class DuplicateListWindow(QWidget):
                     if ext in IMAGE_EXTENSIONS:
                         pixmap = QPixmap(path)
                         if not pixmap.isNull():
-                            thumbnail = pixmap.scaled(180, 180, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                            thumb = pixmap.scaled(180, 180, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                             image_label = QLabel()
-                            image_label.setPixmap(thumbnail)
+                            image_label.setPixmap(thumb)
                             image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                             vbox.addWidget(image_label)
                         else:
@@ -515,15 +831,21 @@ class DuplicateListWindow(QWidget):
                     open_button.clicked.connect(lambda _, p=path: open_file_location(p))
                     vbox.addWidget(open_button)
 
+                    cb = QCheckBox("Select")
+                    cb.setChecked(path in self.selected)
+                    cb.stateChanged.connect(lambda state, p=path: self.mark_selected(p, state == Qt.CheckState.Checked, "grid"))
+                    self.grid_checkboxes[path] = cb
+                    vbox.addWidget(cb)
+
                     box.setLayout(vbox)
-                    box.setFixedSize(200, 250)
+                    box.setFixedSize(200, 270)
                     grid_layout.addWidget(box, row, col)
                     col += 1
                     if col >= col_count:
                         col = 0
                         row += 1
 
-        scroll.setWidget(scroll_content)
+        scroll.setWidget(content)
         return scroll
 
 # --- Background worker to keep UI responsive ---
@@ -581,7 +903,6 @@ def main():
     worker.moveToThread(thread)
 
     def on_finished(duplicates, stats, group_sizes):
-        # Build the main window now, quickly (grid view is lazy)
         window = DuplicateListWindow(duplicates, stats, root_dir, group_sizes)
         window.show()
         splash.close()
