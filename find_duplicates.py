@@ -223,7 +223,7 @@ def find_duplicates(root_dir):
             if (entry and entry.get("algo") == HASH_ALGORITHM and
                 entry.get("size") == sz and entry.get("mtime") == mt and "full_hash" in entry and
                 (not ENABLE_TWO_STAGE or entry.get("quick_hash") == qh_val)):
-                full_hash_map[entry["full_hash"]].append(path)
+                    full_hash_map[entry["full_hash"]].append(path)
 
     if to_full_hash:
         maxw = MAX_WORKERS or max(1, (os.cpu_count() or 2) - 1)
@@ -392,10 +392,10 @@ class GroupWidget(QGroupBox):
         # Per-group delete-others
         del_others = QPushButton("Delete Others (keep 1)")
         del_others.clicked.connect(lambda: on_delete_others(self.files))
-        self.layout.addWidget(del_others, 0, 0, 1, 3)
+        self.layout.addWidget(del_others, 0, 0, 1, 4)
 
         header = QLabel("<b>Files</b>")
-        self.layout.addWidget(header, 0, 3)
+        self.layout.addWidget(header, 0, 4)
 
         self.checkboxes = {}
         self.rows = {}
@@ -408,23 +408,28 @@ class GroupWidget(QGroupBox):
 
             sz = self.file_sizes.get(path)
             size_text = human_readable_size(sz) if isinstance(sz, int) else "N/A"
-            file_label = QLabel(f"{os.path.basename(path)}\n{size_text}")
+            name = os.path.basename(path)
+            dirp = os.path.dirname(path)
+            file_label = QLabel(f"<b>{name}</b><br><span style='color:gray'>{dirp}</span><br>{size_text}")
+            file_label.setTextFormat(Qt.TextFormat.RichText)
             file_label.setWordWrap(True)
             file_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self.layout.addWidget(file_label, idx, 1, 1, 2)
+            self.layout.addWidget(file_label, idx, 1, 1, 3)
 
-            btn = QPushButton("Open in Folder")
-            btn.clicked.connect(lambda _, p=path: on_open(p))
-            self.layout.addWidget(btn, idx, 3)
+            btn_open = QPushButton("Open")
+            btn_open.clicked.connect(lambda _, p=path: on_open(p))
+            self.layout.addWidget(btn_open, idx, 4)
 
-            self.rows[path] = (cb, file_label, btn)
+            btn_copy = QPushButton("Copy path")
+            btn_copy.clicked.connect(lambda _, p=path: QApplication.clipboard().setText(p))
+            self.layout.addWidget(btn_copy, idx, 5)
+
+            self.rows[path] = (cb, file_label, btn_open, btn_copy)
 
     def remove_paths(self, paths_to_remove, new_group_size):
-        """Remove rows for given paths; update header; return whether group still has >=2 files."""
         keep = []
         for p in self.files:
             if p in paths_to_remove:
-                # remove row widgets
                 widgets = self.rows.get(p)
                 if widgets:
                     for w in widgets:
@@ -448,7 +453,7 @@ class DuplicateListWindow(QWidget):
         self.group_widgets = {}  # hash -> GroupWidget
 
         self.setWindowTitle("🖼️ Duplicate File Gallery")
-        self.setGeometry(120, 120, 1100, 820)
+        self.setGeometry(120, 120, 1200, 820)
 
         main_layout = QVBoxLayout(self)
 
@@ -507,7 +512,6 @@ class DuplicateListWindow(QWidget):
         self.build_groups()
 
     def build_groups(self):
-        # Build group widgets once
         for h, files in sorted_duplicate_items(self.duplicates, self.group_sizes):
             gw = GroupWidget(
                 parent=self,
@@ -542,7 +546,6 @@ class DuplicateListWindow(QWidget):
             for p in files:
                 if p != keep and p not in self.selected:
                     self.selected.add(p)
-                    # reflect in UI
                     gw = self.group_widgets.get(h)
                     if gw and p in gw.checkboxes:
                         cb = gw.checkboxes[p]
@@ -551,7 +554,6 @@ class DuplicateListWindow(QWidget):
         QMessageBox.information(self, "Auto-select", f"Selected {added} file(s) for deletion.")
 
     def clear_selection(self):
-        # Efficiently uncheck without rebuilding UI
         for h, gw in self.group_widgets.items():
             for p, cb in gw.checkboxes.items():
                 if p in self.selected:
@@ -643,13 +645,10 @@ class DuplicateListWindow(QWidget):
             QMessageBox.information(self, "Deleted", f"Deleted/trashed {len(deleted)} file(s).")
 
     def apply_deletions(self, deleted_paths):
-        # Update models
         self.setUpdatesEnabled(False)
         deleted_set = set(deleted_paths)
-        # Remove from selection
         self.selected.difference_update(deleted_set)
 
-        # Update duplicates mapping and group sizes
         to_remove_groups = []
         for h, files in list(self.duplicates.items()):
             if not files: continue
@@ -658,7 +657,6 @@ class DuplicateListWindow(QWidget):
                 to_remove_groups.append(h)
             else:
                 self.duplicates[h] = remaining
-                # recompute group size efficiently
                 gtotal = 0
                 for p in remaining:
                     if p in self.file_sizes and self.file_sizes[p] is not None:
@@ -672,16 +670,13 @@ class DuplicateListWindow(QWidget):
                             self.file_sizes[p] = None
                 self.group_sizes[h] = gtotal
 
-        # Update UI widgets per group
         for h, gw in list(self.group_widgets.items()):
             if h in to_remove_groups:
-                # remove whole group
                 gw.setParent(None)
                 del self.group_widgets[h]
                 if h in self.duplicates: del self.duplicates[h]
                 if h in self.group_sizes: del self.group_sizes[h]
             else:
-                # update rows
                 if h in self.duplicates:
                     still_has = gw.remove_paths(deleted_set, self.group_sizes.get(h, 0))
                     if not still_has:
@@ -735,7 +730,7 @@ def main():
     msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
     msg.setFont(QFont("Arial", 12))
     vbox.addWidget(msg)
-    splash.resize(520, 140)
+    splash.resize(700, 160)
     splash.show()
 
     thread = QThread()
