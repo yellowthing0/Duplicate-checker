@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -260,6 +259,9 @@ def find_duplicates(root_dir):
                 file_sizes[p] = None
         group_sizes[h] = total
 
+    # NEW: number of files listed on the result screen (sum of all files across groups)
+    files_listed = sum(len(paths) for paths in duplicates.values())
+
     total_duplicate_size = sum(group_sizes.values())
     if ENABLE_CACHE:
         save_cache(root_dir, {"files": cache_files, "algo": HASH_ALGORITHM, "generated_at": time.time()})
@@ -271,7 +273,8 @@ def find_duplicates(root_dir):
         "reused_cache": reused_cache_full,
         "duplicate_groups": len(duplicates),
         "elapsed_seconds": time.time() - start,
-        "total_duplicate_size": total_duplicate_size
+        "total_duplicate_size": total_duplicate_size,
+        "files_listed": files_listed,  # 👈 NEW
     }
     print("✅ Scan complete.", flush=True)
     return duplicates, stats, group_sizes, file_sizes
@@ -472,6 +475,7 @@ class DuplicateListWindow(QWidget):
             f"🔍 Fully hashed: {stats['full_hashed']}",
             f"💾 Cache hits (full): {stats['reused_cache']}",
             f"🧠 Duplicate groups: {stats['duplicate_groups']}",
+            f"🧾 Files listed: {stats.get('files_listed', 0)}",  # NEW line in UI
             f"🗑️ Total duplicate size: {human_readable_size(stats['total_duplicate_size'])}",
             f"⏱️ Elapsed time: {stats['elapsed_seconds']:.2f}s"
         ]
