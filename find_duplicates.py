@@ -1,3 +1,4 @@
+
 import os
 import sys
 import time
@@ -259,7 +260,7 @@ def find_duplicates(root_dir):
                 file_sizes[p] = None
         group_sizes[h] = total
 
-    # NEW: number of files listed on the result screen (sum of all files across groups)
+    # number of files listed on the result screen
     files_listed = sum(len(paths) for paths in duplicates.values())
 
     total_duplicate_size = sum(group_sizes.values())
@@ -274,7 +275,7 @@ def find_duplicates(root_dir):
         "duplicate_groups": len(duplicates),
         "elapsed_seconds": time.time() - start,
         "total_duplicate_size": total_duplicate_size,
-        "files_listed": files_listed,  # 👈 NEW
+        "files_listed": files_listed,
     }
     print("✅ Scan complete.", flush=True)
     return duplicates, stats, group_sizes, file_sizes
@@ -468,20 +469,9 @@ class DuplicateListWindow(QWidget):
         title.setWordWrap(True)
         main_layout.addWidget(title)
 
-        summary = [
-            f"📦 Total files scanned: {stats['total_files']}",
-            f"📏 Size-based groups: {stats['candidate_size_groups']}",
-            f"⚡ Quick hashed: {stats['two_stage_quick_hashed']}" if ENABLE_TWO_STAGE else "",
-            f"🔍 Fully hashed: {stats['full_hashed']}",
-            f"💾 Cache hits (full): {stats['reused_cache']}",
-            f"🧠 Duplicate groups: {stats['duplicate_groups']}",
-            f"🧾 Files listed: {stats.get('files_listed', 0)}",  # NEW line in UI
-            f"🗑️ Total duplicate size: {human_readable_size(stats['total_duplicate_size'])}",
-            f"⏱️ Elapsed time: {stats['elapsed_seconds']:.2f}s"
-        ]
-        stats_label = QLabel("\n".join([s for s in summary if s]))
-        stats_label.setFont(QFont("Arial", 11))
-        main_layout.addWidget(stats_label)
+        self.stats_label = QLabel()
+        self.stats_label.setFont(QFont("Arial", 11))
+        main_layout.addWidget(self.stats_label)
 
         # Controls row
         controls = QHBoxLayout()
@@ -513,9 +503,15 @@ class DuplicateListWindow(QWidget):
         self.scroll.setWidget(self.scroll_content)
         main_layout.addWidget(self.scroll)
 
+        self.empty_label = QLabel("✅ No duplicates found.")
+        self.empty_label.setVisible(False)
+        self.scroll_layout.addWidget(self.empty_label)
+
         self.build_groups()
+        self.refresh_summary_label()  # initial
 
     def build_groups(self):
+        has_any = False
         for h, files in sorted_duplicate_items(self.duplicates, self.group_sizes):
             gw = GroupWidget(
                 parent=self,
@@ -530,9 +526,33 @@ class DuplicateListWindow(QWidget):
             )
             self.group_widgets[h] = gw
             self.scroll_layout.addWidget(gw)
+            has_any = True
 
-        if not self.group_widgets:
-            self.scroll_layout.addWidget(QLabel("✅ No duplicates found."))
+        self.empty_label.setVisible(not has_any)
+
+    # Stats recompute & label refresh
+    def refresh_summary_label(self):
+        files_listed = sum(len(v) for v in self.duplicates.values())
+        duplicate_groups = len(self.duplicates)
+        total_duplicate_size = sum(self.group_sizes.get(h, 0) for h in self.duplicates.keys())
+
+        # Update internal stats snapshot
+        self.stats["files_listed"] = files_listed
+        self.stats["duplicate_groups"] = duplicate_groups
+        self.stats["total_duplicate_size"] = total_duplicate_size
+
+        summary = [
+            f"📦 Total files scanned: {self.stats['total_files']}",
+            f"📏 Size-based groups: {self.stats['candidate_size_groups']}",
+            f"⚡ Quick hashed: {self.stats['two_stage_quick_hashed']}" if ENABLE_TWO_STAGE else "",
+            f"🔍 Fully hashed: {self.stats['full_hashed']}",
+            f"💾 Cache hits (full): {self.stats['reused_cache']}",
+            f"🧠 Duplicate groups: {duplicate_groups}",
+            f"🧾 Files listed: {files_listed}",
+            f"🗑️ Total duplicate size: {human_readable_size(total_duplicate_size)}",
+            f"⏱️ Elapsed time: {self.stats['elapsed_seconds']:.2f}s"
+        ]
+        self.stats_label.setText("\n".join([s for s in summary if s]))
 
     # Selection helpers
     def on_check_changed(self, path, checked):
@@ -603,7 +623,11 @@ class DuplicateListWindow(QWidget):
         if not self.selected:
             QMessageBox.information(self, "No selection", "No files are selected for deletion.")
             return
-        total = sum((self.file_sizes.get(p) or 0) for p in self.selected)
+        total = 0
+        for p in self.selected:
+            sz = self.file_sizes.get(p)
+            if isinstance(sz, int):
+                total += sz
         pretty = human_readable_size(total)
         ret = QMessageBox.question(
             self, "Confirm Deletion",
@@ -631,7 +655,11 @@ class DuplicateListWindow(QWidget):
         if not victims:
             QMessageBox.information(self, "Nothing to delete", "No other files to delete in this group.")
             return
-        total = sum((self.file_sizes.get(p) or 0) for p in victims)
+        total = 0
+        for p in victims:
+            sz = self.file_sizes.get(p)
+            if isinstance(sz, int):
+                total += sz
         ret = QMessageBox.question(
             self, "Confirm Deletion",
             f"Keep 1 ({os.path.basename(keep)}) and send {len(victims)} other file(s) to Trash?\n"
@@ -663,17 +691,18 @@ class DuplicateListWindow(QWidget):
                 self.duplicates[h] = remaining
                 gtotal = 0
                 for p in remaining:
-                    if p in self.file_sizes and self.file_sizes[p] is not None:
-                        gtotal += self.file_sizes[p]
-                    else:
+                    sz = self.file_sizes.get(p)
+                    if not isinstance(sz, int):
                         try:
                             sz = os.path.getsize(p)
                             self.file_sizes[p] = sz
-                            gtotal += sz
                         except Exception:
+                            sz = 0
                             self.file_sizes[p] = None
+                    gtotal += sz
                 self.group_sizes[h] = gtotal
 
+        # Update UI widgets per group
         for h, gw in list(self.group_widgets.items()):
             if h in to_remove_groups:
                 gw.setParent(None)
@@ -686,10 +715,14 @@ class DuplicateListWindow(QWidget):
                     if not still_has:
                         gw.setParent(None)
                         del self.group_widgets[h]
-                        del self.duplicates[h]
+                        if h in self.duplicates: del self.duplicates[h]
                         if h in self.group_sizes: del self.group_sizes[h]
 
+        # If nothing left, show the empty label
+        self.empty_label.setVisible(len(self.group_widgets) == 0)
+
         self.setUpdatesEnabled(True)
+        self.refresh_summary_label()  # <-- dynamically refresh summary
 
 class ScanWorker(QObject):
     finished = pyqtSignal(dict, dict, dict, dict)
