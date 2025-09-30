@@ -530,29 +530,14 @@ class DuplicateListWindow(QWidget):
 
         self.empty_label.setVisible(not has_any)
 
-    # Stats recompute & label refresh
-    def refresh_summary_label(self):
-        files_listed = sum(len(v) for v in self.duplicates.values())
-        duplicate_groups = len(self.duplicates)
-        total_duplicate_size = sum(self.group_sizes.get(h, 0) for h in self.duplicates.keys())
-
-        # Update internal stats snapshot
-        self.stats["files_listed"] = files_listed
-        self.stats["duplicate_groups"] = duplicate_groups
-        self.stats["total_duplicate_size"] = total_duplicate_size
-
-        summary = [
-            f"📦 Total files scanned: {self.stats['total_files']}",
-            f"📏 Size-based groups: {self.stats['candidate_size_groups']}",
-            f"⚡ Quick hashed: {self.stats['two_stage_quick_hashed']}" if ENABLE_TWO_STAGE else "",
-            f"🔍 Fully hashed: {self.stats['full_hashed']}",
-            f"💾 Cache hits (full): {self.stats['reused_cache']}",
-            f"🧠 Duplicate groups: {duplicate_groups}",
-            f"🧾 Files listed: {files_listed}",
-            f"🗑️ Total duplicate size: {human_readable_size(total_duplicate_size)}",
-            f"⏱️ Elapsed time: {self.stats['elapsed_seconds']:.2f}s"
-        ]
-        self.stats_label.setText("\n".join([s for s in summary if s]))
+    # ---------- NEW: helpers to sync with UI checkboxes ----------
+    def gather_checked_paths(self) -> set:
+        checked = set()
+        for gw in self.group_widgets.values():
+            for p, cb in gw.checkboxes.items():
+                if cb.isChecked():
+                    checked.add(p)
+        return checked
 
     # Selection helpers
     def on_check_changed(self, path, checked):
@@ -564,24 +549,41 @@ class DuplicateListWindow(QWidget):
     def auto_select_deletions(self):
         rule = self.keep_combo.currentText()
         added = 0
+        # Start from current UI state
+        self.selected = self.gather_checked_paths()
+
         for h, files in self.duplicates.items():
-            if len(files) < 2: continue
+            if len(files) < 2:
+                continue
             keep = choose_keep(files, rule)
+            gw = self.group_widgets.get(h)
+            if not gw:
+                continue
+
             for p in files:
-                if p != keep and p not in self.selected:
-                    self.selected.add(p)
-                    gw = self.group_widgets.get(h)
-                    if gw and p in gw.checkboxes:
-                        cb = gw.checkboxes[p]
-                        cb.blockSignals(True); cb.setChecked(True); cb.blockSignals(False)
-                        added += 1
+                want_checked = (p != keep)
+                cb = gw.checkboxes.get(p)
+                if cb and cb.isChecked() != want_checked:
+                    cb.blockSignals(True)
+                    cb.setChecked(want_checked)
+                    cb.blockSignals(False)
+
+                if want_checked and p not in self.selected:
+                    self.selected.add(p); added += 1
+                elif not want_checked and p in self.selected:
+                    self.selected.discard(p)
+
         QMessageBox.information(self, "Auto-select", f"Selected {added} file(s) for deletion.")
 
     def clear_selection(self):
-        for h, gw in self.group_widgets.items():
+        # Uncheck everything in the UI
+        for gw in self.group_widgets.values():
             for p, cb in gw.checkboxes.items():
-                if p in self.selected:
-                    cb.blockSignals(True); cb.setChecked(False); cb.blockSignals(False)
+                if cb.isChecked():
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+        # And clear the backing set
         self.selected.clear()
 
     # Deletion logic
@@ -620,14 +622,12 @@ class DuplicateListWindow(QWidget):
         return deleted, errors
 
     def delete_selected(self):
+        # Rebuild selection from UI to be safe
+        self.selected = self.gather_checked_paths()
         if not self.selected:
             QMessageBox.information(self, "No selection", "No files are selected for deletion.")
             return
-        total = 0
-        for p in self.selected:
-            sz = self.file_sizes.get(p)
-            if isinstance(sz, int):
-                total += sz
+        total = sum((self.file_sizes.get(p) or 0) for p in self.selected)
         pretty = human_readable_size(total)
         ret = QMessageBox.question(
             self, "Confirm Deletion",
@@ -655,11 +655,7 @@ class DuplicateListWindow(QWidget):
         if not victims:
             QMessageBox.information(self, "Nothing to delete", "No other files to delete in this group.")
             return
-        total = 0
-        for p in victims:
-            sz = self.file_sizes.get(p)
-            if isinstance(sz, int):
-                total += sz
+        total = sum((self.file_sizes.get(p) or 0) for p in victims)
         ret = QMessageBox.question(
             self, "Confirm Deletion",
             f"Keep 1 ({os.path.basename(keep)}) and send {len(victims)} other file(s) to Trash?\n"
@@ -722,7 +718,31 @@ class DuplicateListWindow(QWidget):
         self.empty_label.setVisible(len(self.group_widgets) == 0)
 
         self.setUpdatesEnabled(True)
-        self.refresh_summary_label()  # <-- dynamically refresh summary
+        self.refresh_summary_label()  # dynamically refresh summary
+
+    # Stats recompute & label refresh
+    def refresh_summary_label(self):
+        files_listed = sum(len(v) for v in self.duplicates.values())
+        duplicate_groups = len(self.duplicates)
+        total_duplicate_size = sum(self.group_sizes.get(h, 0) for h in self.duplicates.keys())
+
+        # Update internal stats snapshot
+        self.stats["files_listed"] = files_listed
+        self.stats["duplicate_groups"] = duplicate_groups
+        self.stats["total_duplicate_size"] = total_duplicate_size
+
+        summary = [
+            f"📦 Total files scanned: {self.stats['total_files']}",
+            f"📏 Size-based groups: {self.stats['candidate_size_groups']}",
+            f"⚡ Quick hashed: {self.stats['two_stage_quick_hashed']}" if ENABLE_TWO_STAGE else "",
+            f"🔍 Fully hashed: {self.stats['full_hashed']}",
+            f"💾 Cache hits (full): {self.stats['reused_cache']}",
+            f"🧠 Duplicate groups: {duplicate_groups}",
+            f"🧾 Files listed: {files_listed}",
+            f"🗑️ Total duplicate size: {human_readable_size(total_duplicate_size)}",
+            f"⏱️ Elapsed time: {self.stats['elapsed_seconds']:.2f}s"
+        ]
+        self.stats_label.setText("\n".join([s for s in summary if s]))
 
 class ScanWorker(QObject):
     finished = pyqtSignal(dict, dict, dict, dict)
