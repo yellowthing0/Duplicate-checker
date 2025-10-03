@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QScrollArea, QGroupBox,
     QPushButton, QGridLayout, QSizePolicy, QFileDialog, QMessageBox,
-    QHBoxLayout, QCheckBox, QComboBox
+    QHBoxLayout, QCheckBox, QComboBox, QProgressBar, QSpacerItem, QSizePolicy as QSz
 )
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
@@ -120,8 +120,10 @@ def save_cache(root_dir, cache):
     except Exception:
         pass
 
-def list_all_files_with_stats(root_dir):
+def list_all_files_with_stats(root_dir, progress_cb=None):
     files = []
+    estimated = 0
+    last_emit = 0.0
     for dirpath, _, filenames in os.walk(root_dir):
         for fn in filenames:
             full = os.path.join(dirpath, fn)
@@ -132,6 +134,11 @@ def list_all_files_with_stats(root_dir):
                 files.append((full, stat.st_size, int(stat.st_mtime)))
             except Exception:
                 continue
+            now = time.time()
+            if progress_cb and (now - last_emit) > 0.03:
+                estimated += 1
+                last_emit = now
+                progress_cb("listing", estimated, 0, None, f"Listing files… ({len(files)} found)")
     return files
 
 def human_readable_size(size):
@@ -150,13 +157,21 @@ def sorted_duplicate_items(duplicates, group_sizes):
         reverse=True
     )
 
-def find_duplicates(root_dir):
+def find_duplicates(root_dir, progress_cb=None):
     start = time.time()
+    if progress_cb:
+        progress_cb("init", 0, 0, None, "Preparing…")
+
     cache = load_cache(root_dir)
     cache_files = cache.get("files", {}) if cache else {}
 
-    all_files = list_all_files_with_stats(root_dir)
+    if progress_cb:
+        progress_cb("listing", 0, 0, None, "Listing files…")
+    all_files = list_all_files_with_stats(root_dir, progress_cb=progress_cb)
     total_files = len(all_files)
+    if progress_cb:
+        progress_cb("listing_done", total_files, total_files, None, f"Found {total_files} files")
+
     print(f"📁 Scanning: {root_dir} — found {total_files} files", flush=True)
 
     size_groups = defaultdict(list)
@@ -185,10 +200,15 @@ def find_duplicates(root_dir):
     if ENABLE_TWO_STAGE and all_need_quick:
         maxw = MAX_WORKERS or max(1, (os.cpu_count() or 2) - 1)
         Pool = ProcessPoolExecutor if USE_PROCESSES else ThreadPoolExecutor
-        print(f"⚡ Quick hashing {len(all_need_quick)} files using {'processes' if USE_PROCESSES else 'threads'} (workers={maxw})...", flush=True)
+        total_quick = len(all_need_quick)
+        start_quick = time.time()
+        if progress_cb:
+            progress_cb("quick", 0, total_quick, None, f"Quick hashing {total_quick} file(s)…")
         with Pool(max_workers=maxw) as ex:
             futures = {ex.submit(compute_quick, p): (p, sz, mt) for (p, sz, mt) in all_need_quick}
+            completed = 0
             for fut in as_completed(futures):
+                completed += 1
                 path, sz, mt = futures[fut]
                 pth, qh = fut.result()
                 if qh:
@@ -200,6 +220,13 @@ def find_duplicates(root_dir):
                     })
                     cache_files[pth] = entry
                     quick_hashed += 1
+
+                if progress_cb and total_quick:
+                    elapsed = time.time() - start_quick
+                    rate = completed / elapsed if elapsed else 0
+                    remaining = total_quick - completed
+                    eta = (remaining / rate) if rate else None
+                    progress_cb("quick", completed, total_quick, eta, f"Quick hashing… {completed}/{total_quick}")
 
     to_full_hash = []
     for (size, qh), group in quick_groups.items():
@@ -223,14 +250,19 @@ def find_duplicates(root_dir):
             if (entry and entry.get("algo") == HASH_ALGORITHM and
                 entry.get("size") == sz and entry.get("mtime") == mt and "full_hash" in entry and
                 (not ENABLE_TWO_STAGE or entry.get("quick_hash") == qh_val)):
-                    full_hash_map[entry["full_hash"]].append(path)
+                full_hash_map[entry["full_hash"]].append(path)
 
     if to_full_hash:
+        total_full = len(to_full_hash)
+        start_full = time.time()
+        if progress_cb:
+            progress_cb("full", 0, total_full, None, f"Full hashing {total_full} file(s)…")
         maxw = MAX_WORKERS or max(1, (os.cpu_count() or 2) - 1)
-        print(f"🔍 Full hashing {len(to_full_hash)} files using processes (workers={maxw})...", flush=True)
         with ProcessPoolExecutor(max_workers=maxw) as ex:
             futures = {ex.submit(compute_full, p): (p, sz, mt, qh) for (p, sz, mt, qh) in to_full_hash}
+            completed = 0
             for fut in as_completed(futures):
+                completed += 1
                 path, sz, mt, qh = futures[fut]
                 pth, hval = fut.result()
                 if hval:
@@ -244,9 +276,35 @@ def find_duplicates(root_dir):
                     cache_files[path] = entry
                     full_hashed += 1
 
+                if progress_cb:
+                    elapsed = time.time() - start_full
+                    # Smoothed ETA: EWMA throughput to avoid jumpy estimates
+                    # Maintain a small history inside the closure via attributes
+                    if not hasattr(progress_cb, "_last_full_t"):
+                        progress_cb._last_full_t = time.time()
+                        progress_cb._last_full_c = 0
+                        progress_cb._rate_full = None
+                    now = time.time()
+                    dc = completed - progress_cb._last_full_c
+                    dt = now - progress_cb._last_full_t
+                    inst_rate = (dc / dt) if dt > 0 and dc > 0 else None
+                    alpha = 0.25  # smoothing factor
+                    if inst_rate:
+                        if progress_cb._rate_full is None:
+                            progress_cb._rate_full = inst_rate
+                        else:
+                            progress_cb._rate_full = alpha * inst_rate + (1 - alpha) * progress_cb._rate_full
+                    progress_cb._last_full_c = completed
+                    progress_cb._last_full_t = now
+
+                    rate = progress_cb._rate_full or (completed / elapsed if elapsed else 0)
+                    remaining = max(total_full - completed, 0)
+                    eta = (remaining / rate) if rate else None
+
+                    progress_cb("full", completed, total_full, eta, f"Full hashing… {completed}/{total_full}")
+
     duplicates = {h: paths for h, paths in full_hash_map.items() if len(paths) > 1}
 
-    # Precompute group total sizes and an individual size map
     group_sizes = {}
     file_sizes = {}
     for h, paths in duplicates.items():
@@ -260,10 +318,9 @@ def find_duplicates(root_dir):
                 file_sizes[p] = None
         group_sizes[h] = total
 
-    # number of files listed on the result screen
     files_listed = sum(len(paths) for paths in duplicates.values())
-
     total_duplicate_size = sum(group_sizes.values())
+
     if ENABLE_CACHE:
         save_cache(root_dir, {"files": cache_files, "algo": HASH_ALGORITHM, "generated_at": time.time()})
     stats = {
@@ -277,6 +334,10 @@ def find_duplicates(root_dir):
         "total_duplicate_size": total_duplicate_size,
         "files_listed": files_listed,
     }
+
+    if progress_cb:
+        progress_cb("done", 1, 1, 0.0, "Finalizing…")
+
     print("✅ Scan complete.", flush=True)
     return duplicates, stats, group_sizes, file_sizes
 
@@ -304,13 +365,12 @@ def open_file_location(path):
     except Exception as e:
         print(f"[open_file_location] Failed for {path}: {e}", flush=True)
 
-# Windows UNC helper
 def _to_unc_if_network_drive(path):
     if platform.system() != "Windows":
         return path
     try:
         import ctypes
-        from ctypes import wintypes, byref, create_string_buffer, cast, POINTER, c_void_p
+        from ctypes import wintypes, byref, create_string_buffer, cast, POINTER
         p = os.path.abspath(path)
         if len(p) < 2 or p[1] != ":":
             return path
@@ -354,11 +414,17 @@ def _trash_path_windows(p: str) -> bool:
                     pass
         raise
 
-KEEP_RULES = ["Newest (keep most recent)", "Oldest (keep oldest)", "Alphabetical (keep A→Z)", "Shortest path"]
+KEEP_RULES = [
+    "Newest (keep most recent)",
+    "Oldest (keep oldest)",
+    "Alphabetical (keep A→Z)",
+    "Shortest path",
+]
 
 def choose_keep(files, rule_text):
     if rule_text.startswith("Newest"):
-        best = None; best_m = -1
+        best = None
+        best_m = -1
         for p in files:
             try:
                 m = os.stat(p).st_mtime
@@ -368,7 +434,8 @@ def choose_keep(files, rule_text):
                 best_m, best = m, p
         return best or files[0]
     if rule_text.startswith("Oldest"):
-        best = None; best_m = 1e30
+        best = None
+        best_m = 1e30
         for p in files:
             try:
                 m = os.stat(p).st_mtime
@@ -393,7 +460,6 @@ class GroupWidget(QGroupBox):
         self.layout = QGridLayout()
         self.setLayout(self.layout)
 
-        # Per-group delete-others
         del_others = QPushButton("Delete Others (keep 1)")
         del_others.clicked.connect(lambda: on_delete_others(self.files))
         self.layout.addWidget(del_others, 0, 0, 1, 4)
@@ -454,7 +520,7 @@ class DuplicateListWindow(QWidget):
         self.root_dir = root_dir
 
         self.selected = set()
-        self.group_widgets = {}  # hash -> GroupWidget
+        self.group_widgets = {}
 
         self.setWindowTitle("🖼️ Duplicate File Gallery")
         self.setGeometry(120, 120, 1200, 820)
@@ -473,7 +539,6 @@ class DuplicateListWindow(QWidget):
         self.stats_label.setFont(QFont("Arial", 11))
         main_layout.addWidget(self.stats_label)
 
-        # Controls row
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Keep rule:"))
         self.keep_combo = QComboBox()
@@ -495,7 +560,6 @@ class DuplicateListWindow(QWidget):
         controls.addStretch(1)
         main_layout.addLayout(controls)
 
-        # Single list view
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll_content = QWidget()
@@ -508,7 +572,7 @@ class DuplicateListWindow(QWidget):
         self.scroll_layout.addWidget(self.empty_label)
 
         self.build_groups()
-        self.refresh_summary_label()  # initial
+        self.refresh_summary_label()
 
     def build_groups(self):
         has_any = False
@@ -527,10 +591,8 @@ class DuplicateListWindow(QWidget):
             self.group_widgets[h] = gw
             self.scroll_layout.addWidget(gw)
             has_any = True
-
         self.empty_label.setVisible(not has_any)
 
-    # ---------- NEW: helpers to sync with UI checkboxes ----------
     def gather_checked_paths(self) -> set:
         checked = set()
         for gw in self.group_widgets.values():
@@ -539,7 +601,6 @@ class DuplicateListWindow(QWidget):
                     checked.add(p)
         return checked
 
-    # Selection helpers
     def on_check_changed(self, path, checked):
         if checked:
             self.selected.add(path)
@@ -549,9 +610,7 @@ class DuplicateListWindow(QWidget):
     def auto_select_deletions(self):
         rule = self.keep_combo.currentText()
         added = 0
-        # Start from current UI state
         self.selected = self.gather_checked_paths()
-
         for h, files in self.duplicates.items():
             if len(files) < 2:
                 continue
@@ -559,7 +618,6 @@ class DuplicateListWindow(QWidget):
             gw = self.group_widgets.get(h)
             if not gw:
                 continue
-
             for p in files:
                 want_checked = (p != keep)
                 cb = gw.checkboxes.get(p)
@@ -569,24 +627,21 @@ class DuplicateListWindow(QWidget):
                     cb.blockSignals(False)
 
                 if want_checked and p not in self.selected:
-                    self.selected.add(p); added += 1
+                    self.selected.add(p)
+                    added += 1
                 elif not want_checked and p in self.selected:
                     self.selected.discard(p)
-
         QMessageBox.information(self, "Auto-select", f"Selected {added} file(s) for deletion.")
 
     def clear_selection(self):
-        # Uncheck everything in the UI
         for gw in self.group_widgets.values():
-            for p, cb in gw.checkboxes.items():
+            for _, cb in gw.checkboxes.items():
                 if cb.isChecked():
                     cb.blockSignals(True)
                     cb.setChecked(False)
                     cb.blockSignals(False)
-        # And clear the backing set
         self.selected.clear()
 
-    # Deletion logic
     def _delete_paths(self, paths):
         errors = []
         deleted = []
@@ -595,7 +650,8 @@ class DuplicateListWindow(QWidget):
                 if platform.system() == "Windows" and send2trash is not None:
                     try:
                         if _trash_path_windows(p):
-                            deleted.append(p); continue
+                            deleted.append(p)
+                            continue
                     except Exception as trash_err:
                         pretty = os.path.basename(p)
                         ret = QMessageBox.question(
@@ -607,22 +663,26 @@ class DuplicateListWindow(QWidget):
                         )
                         if ret == QMessageBox.StandardButton.Yes:
                             try:
-                                os.remove(p); deleted.append(p); continue
+                                os.remove(p)
+                                deleted.append(p)
+                                continue
                             except Exception as e2:
-                                errors.append((p, str(e2))); continue
+                                errors.append((p, str(e2)))
+                                continue
                         else:
-                            errors.append((p, str(trash_err))); continue
-                # Non-Windows or no send2trash
+                            errors.append((p, str(trash_err)))
+                            continue
                 if send2trash is not None and platform.system() != "Windows":
-                    send2trash(p); deleted.append(p)
+                    send2trash(p)
+                    deleted.append(p)
                 else:
-                    os.remove(p); deleted.append(p)
+                    os.remove(p)
+                    deleted.append(p)
             except Exception as e:
                 errors.append((p, str(e)))
         return deleted, errors
 
     def delete_selected(self):
-        # Rebuild selection from UI to be safe
         self.selected = self.gather_checked_paths()
         if not self.selected:
             QMessageBox.information(self, "No selection", "No files are selected for deletion.")
@@ -679,7 +739,8 @@ class DuplicateListWindow(QWidget):
 
         to_remove_groups = []
         for h, files in list(self.duplicates.items()):
-            if not files: continue
+            if not files:
+                continue
             remaining = [p for p in files if p not in deleted_set and os.path.exists(p)]
             if len(remaining) < 2:
                 to_remove_groups.append(h)
@@ -698,39 +759,37 @@ class DuplicateListWindow(QWidget):
                     gtotal += sz
                 self.group_sizes[h] = gtotal
 
-        # Update UI widgets per group
         for h, gw in list(self.group_widgets.items()):
             if h in to_remove_groups:
                 gw.setParent(None)
                 del self.group_widgets[h]
-                if h in self.duplicates: del self.duplicates[h]
-                if h in self.group_sizes: del self.group_sizes[h]
+                if h in self.duplicates:
+                    del self.duplicates[h]
+                if h in self.group_sizes:
+                    del self.group_sizes[h]
             else:
                 if h in self.duplicates:
                     still_has = gw.remove_paths(deleted_set, self.group_sizes.get(h, 0))
                     if not still_has:
                         gw.setParent(None)
                         del self.group_widgets[h]
-                        if h in self.duplicates: del self.duplicates[h]
-                        if h in self.group_sizes: del self.group_sizes[h]
+                        if h in self.duplicates:
+                            del self.duplicates[h]
+                        if h in self.group_sizes:
+                            del self.group_sizes[h]
 
-        # If nothing left, show the empty label
         self.empty_label.setVisible(len(self.group_widgets) == 0)
 
         self.setUpdatesEnabled(True)
-        self.refresh_summary_label()  # dynamically refresh summary
+        self.refresh_summary_label()
 
-    # Stats recompute & label refresh
     def refresh_summary_label(self):
         files_listed = sum(len(v) for v in self.duplicates.values())
         duplicate_groups = len(self.duplicates)
         total_duplicate_size = sum(self.group_sizes.get(h, 0) for h in self.duplicates.keys())
-
-        # Update internal stats snapshot
         self.stats["files_listed"] = files_listed
         self.stats["duplicate_groups"] = duplicate_groups
         self.stats["total_duplicate_size"] = total_duplicate_size
-
         summary = [
             f"📦 Total files scanned: {self.stats['total_files']}",
             f"📏 Size-based groups: {self.stats['candidate_size_groups']}",
@@ -747,6 +806,7 @@ class DuplicateListWindow(QWidget):
 class ScanWorker(QObject):
     finished = pyqtSignal(dict, dict, dict, dict)
     error = pyqtSignal(str)
+    progress = pyqtSignal(str, int, int, float, str)  # stage, current, total, eta, message
 
     def __init__(self, root_dir):
         super().__init__()
@@ -754,7 +814,9 @@ class ScanWorker(QObject):
 
     def run(self):
         try:
-            dups, stats, group_sizes, file_sizes = find_duplicates(self.root_dir)
+            def cb(stage, current, total, eta, message):
+                self.progress.emit(stage, int(current or 0), int(total or 0), float(eta) if eta is not None else -1.0, message or "")
+            dups, stats, group_sizes, file_sizes = find_duplicates(self.root_dir, progress_cb=cb)
             self.finished.emit(dups, stats, group_sizes, file_sizes)
         except Exception as e:
             self.error.emit(str(e))
@@ -765,6 +827,18 @@ def pick_or_cli_dir():
     start_dir = os.path.expanduser("~")
     root_dir = QFileDialog.getExistingDirectory(None, "Select a folder to scan for duplicates", start_dir)
     return root_dir
+
+def format_eta(seconds):
+    if seconds is None or seconds < 0:
+        return "Estimating…"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s remaining"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s remaining"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s remaining"
 
 def main():
     try:
@@ -779,20 +853,111 @@ def main():
         QMessageBox.information(None, "Duplicate File Gallery", "No folder selected. Exiting.")
         sys.exit(0)
 
-    # Simple splash while scanning
-    splash = QWidget()
-    splash.setWindowTitle("Duplicate File Gallery — Scanning...")
-    vbox = QVBoxLayout(splash)
-    msg = QLabel(f"Scanning {root_dir}...\nThis window will update when the scan completes.")
-    msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    msg.setFont(QFont("Arial", 12))
-    vbox.addWidget(msg)
-    splash.resize(700, 160)
+    # --- Centered scanning splash ---
+    splash = QWidget(flags=Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint)
+    splash.setWindowTitle("Duplicate File Gallery — Scanning…")
+
+    vwrap = QVBoxLayout(splash)
+    vwrap.setContentsMargins(24, 18, 24, 18)
+
+    vwrap.addItem(QSpacerItem(0, 10, QSz.Policy.Minimum, QSz.Policy.Expanding))
+
+    center = QWidget()
+    center_layout = QVBoxLayout(center)
+    center_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+    center.setMaximumWidth(640)
+
+    head = QLabel(f"Scanning {root_dir}")
+    head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    head.setFont(QFont("Arial", 12))
+
+    status = QLabel("Preparing…")
+    status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    bar = QProgressBar()
+    bar.setFixedWidth(520)
+    bar.setRange(0, 0)
+
+    eta_label = QLabel("Estimating…")
+    eta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    for w in (head, status, bar, eta_label):
+        center_layout.addWidget(w, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+    vwrap.addWidget(center, alignment=Qt.AlignmentFlag.AlignHCenter)
+    vwrap.addItem(QSpacerItem(0, 10, QSz.Policy.Minimum, QSz.Policy.Expanding))
+
+    splash.resize(800, 220)
     splash.show()
 
     thread = QThread()
     worker = ScanWorker(root_dir)
     worker.moveToThread(thread)
+
+    # --- Smoothed ETA state (shared between stages) ---
+    class EtaState:
+        def __init__(self):
+            self.stage = None
+            self.last_t = None
+            self.last_c = 0
+            self.rate = None
+
+        def update(self, stage, completed, total):
+            now = time.time()
+            if self.stage != stage:
+                # reset when stage changes
+                self.stage = stage
+                self.last_t = now
+                self.last_c = completed
+                self.rate = None
+                return None
+            if self.last_t is None:
+                self.last_t = now
+                self.last_c = completed
+                return None
+            dc = completed - self.last_c
+            dt = now - self.last_t
+            self.last_t = now
+            self.last_c = completed
+            if dt <= 0 or dc <= 0:
+                return None
+            inst_rate = dc / dt
+            alpha = 0.25
+            if self.rate is None:
+                self.rate = inst_rate
+            else:
+                self.rate = alpha * inst_rate + (1 - alpha) * self.rate
+            if not self.rate or self.rate <= 0 or total <= 0:
+                return None
+            remaining = max(total - completed, 0)
+            return remaining / self.rate if self.rate else None
+
+    eta_state = EtaState()
+
+    def on_progress(stage, current, total, eta, message):
+        status.setText(message)
+        if stage in ("quick", "full"):
+            if total > 0:
+                if bar.maximum() != total:
+                    bar.setRange(0, total)
+                bar.setValue(current)
+            else:
+                bar.setRange(0, 0)
+            # prefer our smoothed ETA; fall back to worker-provided
+            sm_eta = eta_state.update(stage, current, total)
+            eta_label.setText(format_eta(sm_eta if sm_eta is not None else (eta if eta >= 0 else None)))
+        elif stage in ("listing", "listing_done"):
+            if stage == "listing_done":
+                bar.setRange(0, 1)
+                bar.setValue(1)
+            else:
+                bar.setRange(0, 0)
+            eta_state.stage = "listing"
+            eta_label.setText("")
+        elif stage == "done":
+            bar.setRange(0, 1)
+            bar.setValue(1)
+            eta_label.setText("")
 
     def on_finished(duplicates, stats, group_sizes, file_sizes):
         window = DuplicateListWindow(duplicates, stats, root_dir, group_sizes, file_sizes)
@@ -810,6 +975,7 @@ def main():
         sys.exit(2)
 
     thread.started.connect(worker.run)
+    worker.progress.connect(on_progress)
     worker.finished.connect(on_finished)
     worker.error.connect(on_error)
 
